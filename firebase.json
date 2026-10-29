@@ -1,0 +1,41 @@
+{
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+  "storage": {
+    "rules": "storage.rules"
+  },
+  "emulators": {
+    "firestore": { "port": 8786 },
+    "ui": { "enabled": false }
+  },
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "groceryapp-ac3e7",
+          "appId": "1:616286570559:android:90421318037b76060b908a",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "ios": {
+        "default": {
+          "projectId": "groceryapp-ac3e7",
+          "appId": "1:616286570559:ios:a11abf7abc5fc1e60b908a",
+          "uploadDebugSymbols": false,
+          "fileOutput": "ios/Runner/GoogleService-Info.plist"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "groceryapp-ac3e7",
+          "configurations": {
+            "android": "1:616286570559:android:90421318037b76060b908a",
+            "ios": "1:616286570559:ios:a11abf7abc5fc1e60b908a"
+          }
+        }
+      }
+    }
+  }
+}

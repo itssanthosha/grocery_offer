@@ -1,0 +1,281 @@
+rules_version = '2';
+
+// PriceMate security rules (Phase 3).
+//
+// Everything a user can do works WITHOUT Cloud Functions: the client writes the
+// price AND the denormalized products.latestPrices entry in one batch, and the
+// rules below check that the two agree. Cloud Functions (Phase 6) add what
+// clients may never do: points, trustScore, reportsCount, expiring offers.
+//
+// Mirrored limits in the app: lib/features/prices/domain/price_rules.dart
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() { return request.auth != null; }
+    // Guests are anonymous Firebase users; only real accounts may write.
+    function isRealUser() {
+      return signedIn() && request.auth.token.firebase.sign_in_provider != 'anonymous';
+    }
+    function uid() { return request.auth.uid; }
+    function isAdmin() { return signedIn() && request.auth.token.admin == true; }
+    function notBanned() {
+      return !exists(/databases/$(database)/documents/users/$(uid()))
+        || get(/databases/$(database)/documents/users/$(uid())).data.isBanned != true;
+    }
+    function canWrite() { return isRealUser() && notBanned(); }
+
+    // UTC calendar day as an int, e.g. 20261029 (matches the client).
+    function dayId() {
+      return string(request.time.year() * 10000 + request.time.month() * 100 + request.time.day());
+    }
+
+    // ---------- users ----------
+    match /users/{userId} {
+      allow read: if signedIn() && (uid() == userId || isAdmin());
+      // points, trustScore, reportsCount, isBanned are server-only.
+      allow create: if signedIn()
+        && uid() == userId
+        && request.resource.data.points == 0
+        && request.resource.data.trustScore == 50
+        && request.resource.data.reportsCount == 0
+        && request.resource.data.isBanned == false;
+      allow update: if signedIn() && uid() == userId
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['displayName', 'photoUrl', 'city', 'language']);
+    }
+
+    // ---------- catalogue ----------
+    // chains are seeded with the Admin SDK (tool/seed); clients only read.
+    match /chains/{id} {
+      allow read: if true;
+    }
+
+    match /stores/{id} {
+      allow read: if true;
+      allow create: if canWrite()
+        && request.resource.data.keys().hasOnly(
+             ['chainId', 'branchName', 'city', 'area', 'geo', 'addedBy', 'verified'])
+        && request.resource.data.keys().hasAll(
+             ['chainId', 'branchName', 'city', 'geo', 'addedBy', 'verified'])
+        && request.resource.data.chainId in [
+             'lulu', 'carrefour', 'nesto', 'alfair', 'almeera', 'safeer',
+             'sultancenter', 'spar', 'ramez', 'kmtrading', 'mars']
+        && request.resource.data.branchName is string
+        && request.resource.data.branchName.size() >= 2
+        && request.resource.data.branchName.size() <= 80
+        && request.resource.data.city is string
+        && request.resource.data.city.size() <= 30
+        && (!('area' in request.resource.data)
+            || (request.resource.data.area is string && request.resource.data.area.size() <= 60))
+        && request.resource.data.geo.geopoint is latlng
+        && request.resource.data.geo.geohash is string
+        && request.resource.data.geo.geohash.size() == 9
+        && request.resource.data.addedBy == uid()
+        && request.resource.data.verified == false;
+    }
+
+    match /products/{productId} {
+      allow read: if true;
+
+      allow create: if canWrite()
+        && request.resource.data.createdBy == uid()
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 1
+        && request.resource.data.name.size() <= 120
+        && request.resource.data.categoryId is string
+        && request.resource.data.searchKeywords is list
+        && request.resource.data.searchKeywords.size() <= 200
+        && request.resource.data.latestPrices.size() == 0
+        && !('lastPriceAt' in request.resource.data)
+        && !('lastPriceId' in request.resource.data)
+        && (!('barcode' in request.resource.data)
+            || (request.resource.data.barcode is string
+                && request.resource.data.barcode.size() <= 20));
+
+      // Only the latestPrices entry of ONE store may change, and it must agree
+      // with the price document written/changed in the same batch.
+      allow update: if canWrite() && latestPriceUpdateOk(productId);
+
+      function reportPath(priceId) {
+        return /databases/$(database)/documents/reports/$(priceId + '_' + uid());
+      }
+
+      function entryMatchesPrice(e, priceId, price, store) {
+        return e.keys().hasOnly(
+               ['priceId', 'storeId', 'chainId', 'branchName', 'lat', 'lng', 'priceBaisa',
+                'isOffer', 'offerEndDate', 'reportedAt', 'confirmations', 'verified',
+                'hasPhoto', 'flags', 'reportedBy'])
+          && e.priceId == priceId
+          && e.storeId == price.storeId
+          && e.chainId == price.chainId
+          && e.priceBaisa == price.priceBaisa
+          && e.isOffer == price.isOffer
+          && e.get('offerEndDate', null) == price.get('offerEndDate', null)
+          && e.reportedAt == price.reportedAt
+          && e.reportedBy == price.reportedBy
+          && e.confirmations == price.confirmations
+          && e.flags == price.flags
+          && e.hasPhoto == (price.get('photoUrl', null) != null)
+          && e.verified == (price.confirmations >= 3
+               || (price.get('photoUrl', null) != null && price.confirmations >= 1))
+          && e.branchName == store.branchName
+          && e.lat == store.geo.geopoint.latitude()
+          && e.lng == store.geo.geopoint.longitude();
+      }
+
+      function latestPriceUpdateOk(productId) {
+        let n = request.resource.data;
+        let o = resource.data;
+        let priceId = n.lastPriceId;
+        let price = getAfter(/databases/$(database)/documents/prices/$(priceId)).data;
+        let sid = price.storeId;
+        let store = get(/databases/$(database)/documents/stores/$(sid)).data;
+        return n.diff(o).affectedKeys().hasOnly(['latestPrices', 'lastPriceAt', 'lastPriceId'])
+          && (n.get('lastPriceAt', null) == o.get('lastPriceAt', null)
+              || n.lastPriceAt == request.time)
+          && price.productId == productId
+          && n.latestPrices.diff(o.latestPrices).affectedKeys().hasOnly([sid])
+          // the caller reported, confirmed or flagged this very price
+          && (price.reportedBy == uid()
+              || uid() in price.confirmedBy
+              || (existsAfter(reportPath(priceId))
+                  && getAfter(reportPath(priceId)).data.createdAt == request.time))
+          && (sid in n.latestPrices
+              // entry added/updated: never move to an older price
+              ? (entryMatchesPrice(n.latestPrices[sid], priceId, price, store)
+                 && price.flags < 3
+                 && price.status == 'active'
+                 && (!(sid in o.latestPrices)
+                     || price.reportedAt >= o.latestPrices[sid].reportedAt))
+              // entry removed: only because 3+ users flagged that price
+              : (price.flags >= 3
+                 && sid in o.latestPrices
+                 && o.latestPrices[sid].priceId == priceId));
+      }
+    }
+
+    // ---------- prices ----------
+    match /prices/{priceId} {
+      function validPriceFields(d) {
+        return d.priceBaisa is int
+          && d.priceBaisa >= 1
+          && d.priceBaisa <= 1000000
+          && d.isOffer is bool
+          && (!('offerEndDate' in d) || (d.isOffer == true && d.offerEndDate is timestamp))
+          && (!('photoUrl' in d) || (d.photoUrl is string && d.photoUrl.size() <= 500));
+      }
+
+      function rateLimitPath(d) {
+        return /databases/$(database)/documents/rateLimits/$(uid() + '_' + d.productId + '_' + d.storeId);
+      }
+      function dailyPath() {
+        return /databases/$(database)/documents/dailyCounts/$(uid() + '_' + dayId());
+      }
+
+      // Anyone can read active prices. (Flag-hidden ones are filtered in the app.)
+      allow read: if resource.data.status == 'active'
+        || (signedIn() && resource.data.reportedBy == uid())
+        || isAdmin();
+
+      allow create: if canWrite()
+        && request.resource.data.keys().hasOnly(
+             ['productId', 'storeId', 'chainId', 'priceBaisa', 'isOffer', 'offerEndDate',
+              'photoUrl', 'reportedBy', 'reportedAt', 'confirmations', 'confirmedBy',
+              'flags', 'status', 'needsReview'])
+        && request.resource.data.keys().hasAll(
+             ['productId', 'storeId', 'chainId', 'priceBaisa', 'isOffer', 'reportedBy',
+              'reportedAt', 'confirmations', 'confirmedBy', 'flags', 'status', 'needsReview'])
+        && validPriceFields(request.resource.data)
+        && request.resource.data.productId is string
+        && request.resource.data.storeId is string
+        && request.resource.data.chainId is string
+        && request.resource.data.reportedBy == uid()
+        && request.resource.data.reportedAt == request.time
+        && request.resource.data.confirmations == 0
+        && request.resource.data.confirmedBy == []
+        && request.resource.data.flags == 0
+        && request.resource.data.status == 'active'
+        && request.resource.data.needsReview is bool
+        && exists(/databases/$(database)/documents/products/$(request.resource.data.productId))
+        && get(/databases/$(database)/documents/stores/$(request.resource.data.storeId)).data.chainId
+             == request.resource.data.chainId
+        // proof that this same batch touched the rate-limit and daily counters
+        && getAfter(rateLimitPath(request.resource.data)).data.lastAt == request.time
+        && getAfter(dailyPath()).data.lastAt == request.time;
+
+      allow update: if canWrite() && (
+        // 1) confirm: another user, once, +1
+        (resource.data.status == 'active'
+          && resource.data.reportedBy != uid()
+          && !(uid() in resource.data.confirmedBy)
+          && request.resource.data.diff(resource.data).affectedKeys()
+               .hasOnly(['confirmations', 'confirmedBy'])
+          && request.resource.data.confirmations == resource.data.confirmations + 1
+          && request.resource.data.confirmedBy == resource.data.confirmedBy.concat([uid()]))
+        // 2) flag: another user, +1, with the report created in the same batch
+        || (resource.data.status == 'active'
+          && resource.data.reportedBy != uid()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['flags'])
+          && request.resource.data.flags == resource.data.flags + 1
+          && getAfter(/databases/$(database)/documents/reports/$(priceId + '_' + uid())).data.createdAt
+               == request.time)
+        // 3) author edits their own price within 1 hour
+        || (resource.data.reportedBy == uid()
+          && request.time < resource.data.reportedAt + duration.value(1, 'h')
+          && request.resource.data.diff(resource.data).affectedKeys()
+               .hasOnly(['priceBaisa', 'isOffer', 'offerEndDate', 'photoUrl'])
+          && validPriceFields(request.resource.data))
+      );
+
+      allow delete: if canWrite()
+        && resource.data.reportedBy == uid()
+        && request.time < resource.data.reportedAt + duration.value(1, 'h');
+    }
+
+    // ---------- moderation ----------
+    // One report per user per price: the id enforces it.
+    match /reports/{reportId} {
+      allow read: if isAdmin();
+      allow create: if canWrite()
+        && request.resource.data.keys().hasOnly(['priceId', 'reportedBy', 'reason', 'createdAt'])
+        && reportId == request.resource.data.priceId + '_' + uid()
+        && request.resource.data.reportedBy == uid()
+        && request.resource.data.reason in ['wrong price', 'wrong product', 'spam', 'offer ended']
+        && request.resource.data.createdAt == request.time
+        && exists(/databases/$(database)/documents/prices/$(request.resource.data.priceId));
+      allow update, delete: if false;
+    }
+
+    // ---------- abuse limits (enforced here, no Cloud Function needed) ----------
+    // Same user + product + store at most once per 6 hours.
+    match /rateLimits/{id} {
+      allow read: if signedIn() && id.matches(uid() + '_.*');
+      allow create: if canWrite()
+        && id.matches(uid() + '_.*')
+        && request.resource.data.keys().hasOnly(['lastAt'])
+        && request.resource.data.lastAt == request.time;
+      allow update: if canWrite()
+        && id.matches(uid() + '_.*')
+        && request.resource.data.keys().hasOnly(['lastAt'])
+        && request.resource.data.lastAt == request.time
+        && request.time >= resource.data.lastAt + duration.value(6, 'h');
+    }
+
+    // At most 50 price submissions per user per UTC day.
+    match /dailyCounts/{id} {
+      allow read: if signedIn() && id.matches(uid() + '_.*');
+      allow create: if canWrite()
+        && id == uid() + '_' + dayId()
+        && request.resource.data.keys().hasOnly(['count', 'lastAt'])
+        && request.resource.data.count == 1
+        && request.resource.data.lastAt == request.time;
+      allow update: if canWrite()
+        && id == uid() + '_' + dayId()
+        && request.resource.data.keys().hasOnly(['count', 'lastAt'])
+        && request.resource.data.count == resource.data.count + 1
+        && request.resource.data.count <= 50
+        && request.resource.data.lastAt == request.time;
+    }
+  }
+}

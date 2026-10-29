@@ -1,0 +1,10 @@
+{
+  "name": "pricemate-seed",
+  "private": true,
+  "type": "module",
+  "description": "One-off Firestore seeding for chains and stores",
+  "dependencies": {
+    "firebase-admin": "^13.0.0",
+    "ngeohash": "^0.6.3"
+  }
+}
